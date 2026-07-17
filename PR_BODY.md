@@ -50,11 +50,41 @@ architecture interoperability, not a general-purpose training framework.
   `ModuleList` or `ModuleDict`, producing clear construction-time errors
   for unsupported module shapes.
 - **`build_pretrain_bridge(model, cfg)`**: the public entry point. Wraps
-  the source model, normalizes its output contract, and ensures bridge
-  mode changes propagate to the source model (see Scope boundaries).
-  Direct `build_bridge_from_module` use still works for advanced cases.
-- Registered `"SwiGLUMoEForCausalLM"` in `SUPPORTED_ARCHITECTURES` and
-  `INTENTIONAL_EXCLUDES` (no HF Hub checkpoint backs it).
+  the source model and normalizes its output contract. Direct
+  `build_bridge_from_module` use still works for advanced cases.
+- **`TransformerBridge.train()` fix (bug fix, affects all bridges):**
+  `original_model` is intentionally stored outside the registered module
+  tree (assigned via `self.__dict__` rather than `nn.Module.__setattr__`);
+  consequently, inherited `nn.Module.train()` -- which only recurses into
+  registered submodules -- never reached the wrapped source model, so
+  `bridge.train()`/`bridge.eval()` silently left mode-dependent layers
+  (dropout etc.) in whatever mode the model was in at wrap time.
+  `TransformerBridge.train()` now
+  also sets mode on `original_model`; `eval()` needs no override since
+  `nn.Module.eval()` calls `self.train(False)`. Note this propagates to
+  every bridge, including HF-backed ones -- consistent with standard
+  `nn.Module` semantics and with the bridge's delegation of other
+  lifecycle operations (`to`/`cuda`/`cpu`/`mps`, `state_dict`,
+  `parameters`) to `original_model` -- but flagged here so the
+  blast radius is reviewed consciously. Authoritative regression coverage
+  lives at the bridge level in
+  `tests/unit/model_bridge/test_bridge_train_mode_propagation.py`
+  (`TestTrainEvalModePropagation`),
+  against a minimal architecture-independent stub bridge (propagation both
+  directions, `train()`/`eval()` returning `self` per `nn.Module` chaining
+  convention, direct-on-model mode setting staying in sync); one
+  end-to-end smoke test through `build_pretrain_bridge` remains in the
+  container test module. The bug is reproducible on released
+  transformer-lens 3.5.1 (the propagation tests fail there without the
+  override), so this is a live-release fix, not one only reachable
+  through the new adapter. No `HookedTransformer` counterpart change is
+  needed: it has no wrapped `original_model` -- its components are
+  ordinary registered submodules, which inherited `nn.Module.train()`
+  already reaches.
+- Registered `"TransformerLensPretrain"` in `SUPPORTED_ARCHITECTURES` and
+  added it to the model-registry synchronization test's internal-only
+  exclusion set, since no Hugging Face Hub architecture or checkpoint
+  backs this key.
 - Config mutation: like `nanogpt.py`, the adapter mutates the passed-in
   `cfg` in place rather than copying it.
 - Unit tests split by concern: `test_pretrain_adapter.py` (mapping,
@@ -134,10 +164,9 @@ the class docstring. Kept local rather than generalizing
 
 The dense/MoE delegate is excluded from the public module tree to avoid
 duplicate hook points; forward execution, gradients, dtype/device
-conversion, `state_dict`-based reconstruction, hook lifecycle, and (via a
-small generated subclass) train/eval mode all still reach the wrapped
-source model — see Scope boundaries for why train/eval needed a
-workaround here.
+conversion, `state_dict`-based reconstruction, hook lifecycle, and
+train/eval mode (via the `TransformerBridge.train()` fix above) all still
+reach the wrapped source model.
 
 ## Hook coverage
 
@@ -159,11 +188,11 @@ experiment tracking, distributed training, or checkpoint-shard
 reconstruction — those stay with the source framework. This PR only adds
 the TransformerBridge mapping and its tests.
 
-Worth flagging for discussion: `build_pretrain_bridge` reassigns
-`bridge.__class__` to propagate train/eval mode (see code comments).
-Reassigning `__class__` at runtime is unconventional; a
-`TransformerBridge.train()` fix upstream would be cleaner if maintainers
-are open to that scope.
+Train/eval mode propagation is fixed upstream in
+`TransformerBridge.train()` (see What changed) rather than worked around
+in the adapter -- an earlier draft reassigned `bridge.__class__` to a
+generated subclass; that machinery is gone, and `build_pretrain_bridge`
+now returns the bridge from `build_bridge_from_module` unchanged.
 
 Persistence is tested by saving the source model's pre-bridge
 `state_dict`, reconstructing the source model and bridge from
@@ -178,6 +207,7 @@ serialization.
 ## Testing
 
 ```bash
+python -m pytest tests/unit/model_bridge/test_bridge_train_mode_propagation.py -v
 python -m pytest tests/unit/model_bridge/supported_architectures/test_pretrain_adapter.py -v
 python -m pytest tests/unit/model_bridge/supported_architectures/test_pretrain_model_container.py -v
 python -m pytest tests/integration/model_bridge/test_pretrain_adapter.py -v
@@ -185,8 +215,10 @@ python -m pytest tests/unit/model_bridge/generalized_components/test_moe_bridge_
 python -m pytest tests/unit/tools/test_model_registry.py -k TestRegistrySyncedWithFactory -v
 ```
 
-Locally: 81 tests passed (30 adapter unit, 34 container unit, 9
-integration, 4 generalized-component unit tests (MoEBridge tuple-output
+Locally: 82 tests passed (4 bridge-level unit tests
+(`TransformerBridge.train()` mode propagation, stub bridge), 30
+adapter unit, 31 container unit, 9 integration, 4
+generalized-component unit tests (MoEBridge tuple-output
 validation), and 4 registry-sync tests). Covers: component
 mapping and MLP dispatch (dense/MoE/mixed, checking actual
 `run_with_cache` keys, not just `isinstance`, plus basic
@@ -198,8 +230,10 @@ validation, so a mismatch silently reports wrong numbers on `bridge.cfg`
 -- see `TestIntegrationFixturesSupplyATruthfulConfig`); activation
 caching and hook interventions; kwarg filtering and output-normalization
 edge cases; hook registration, gradients, dtype/device, `state_dict`-based
-reconstruction; train/eval mode propagation (a cached generated subclass,
-rather than per-instance method closures); malformed-architecture errors;
+reconstruction; train/eval mode propagation (authoritative
+architecture-independent coverage at the bridge level in
+`test_bridge_train_mode_propagation.py`, plus one end-to-end smoke through
+`build_pretrain_bridge`); malformed-architecture errors;
 `MoEBridge`'s own tuple-output validation and router-score hook gating
 (empty tuple, non-tensor first element, non-tensor metadata preserved
 without firing the hook, tensor router scores still firing it);
@@ -221,7 +255,9 @@ preservation through construction only, not full parity at that dtype.
 
 Please delete options that are not relevant.
 
-- [ ] Bug fix (non-breaking change which fixes an issue)
+- [x] Bug fix (non-breaking change which fixes an issue --
+  `TransformerBridge.train()`/`eval()` not reaching the wrapped
+  `original_model`)
 - [x] New feature (non-breaking change which adds functionality)
 - [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
 - [ ] This change requires a documentation update

@@ -57,7 +57,7 @@ from transformer_lens.model_bridge.generalized_components.base import (
     GeneralizedComponent,
 )
 
-ARCHITECTURE_NAME = "SwiGLUMoEForCausalLM"
+ARCHITECTURE_NAME = "TransformerLensPretrain"
 
 # Reserved bridge kwargs removed before forwarding to the wrapped model.
 # Only known bridge-compatibility kwargs are stripped so genuine caller
@@ -398,54 +398,6 @@ class PretrainArchitectureAdapter(ArchitectureAdapter):
         }
 
 
-# Cache of per-base-class mode-propagating TransformerBridge subclasses.
-# Keyed on the concrete base class actually returned by
-# build_bridge_from_module, since that isn't guaranteed to always be the
-# same TransformerBridge subclass.
-_MODE_PROPAGATING_BRIDGE_CLASSES: dict[type, type] = {}
-
-
-def _get_mode_propagating_bridge_class(base: type) -> type:
-    """Return a cached subclass of `base` whose `train()` also propagates
-    to `self.original_model`. Only `train()` is overridden --
-    `nn.Module.eval()` already calls `self.train(False)`, which dispatches
-    to this override.
-
-    A generated subclass avoids replacing `train` with a per-instance
-    closure and preserves ordinary class-based method dispatch, pickling
-    registration, and introspection. Registered into this module's
-    namespace under a name derived from `base`'s module and qualified name
-    (not just `base.__name__`, which two distinct base classes could
-    share) so `pickle` can find it by `__module__`/`__qualname__`. This
-    makes a name collision very unlikely in practice, not strictly
-    impossible -- the transformation isn't injective (e.g. distinct
-    dotted names could theoretically normalize to the same string after
-    `.` -> `_`).
-    """
-    cached = _MODE_PROPAGATING_BRIDGE_CLASSES.get(base)
-    if cached is not None:
-        return cached
-
-    class _ModePropagatingBridge(base):  # type: ignore[misc,valid-type]
-        def train(self, mode: bool = True) -> TransformerBridge:
-            super().train(mode)
-            original = getattr(self, "original_model", None)
-            if isinstance(original, torch.nn.Module):
-                original.train(mode)
-            return self
-
-    safe_module = base.__module__.replace(".", "_")
-    safe_qualname = base.__qualname__.replace(".", "_")
-    name = f"_ModePropagating_{safe_module}_{safe_qualname}"
-    _ModePropagatingBridge.__name__ = name
-    _ModePropagatingBridge.__qualname__ = name
-    _ModePropagatingBridge.__module__ = __name__
-    globals()[name] = _ModePropagatingBridge  # importable, so pickle can find it
-
-    _MODE_PROPAGATING_BRIDGE_CLASSES[base] = _ModePropagatingBridge
-    return _ModePropagatingBridge
-
-
 def build_pretrain_bridge(
     model: torch.nn.Module,
     cfg: TransformerBridgeConfig,
@@ -461,14 +413,12 @@ def build_pretrain_bridge(
     `device`/`dtype`/`model_name` forward to `build_bridge_from_module`
     only when explicitly given.
 
-    `bridge.train()`/`.eval()` propagate to `model`: `TransformerBridge`'s
-    own train/eval only walk `component_mapping`, which never includes
-    `original_model`, so this function reassigns the returned bridge's
-    class to a small generated subclass (see
-    `_get_mode_propagating_bridge_class`) that closes the gap. Ideally
-    this would instead be a small fix to `TransformerBridge.train()`
-    itself (a general lifecycle fix, not architecture-specific) -- kept
-    local here to stay within this PR's scope; worth revisiting upstream.
+    `bridge.train()`/`.eval()` propagate to `model` via
+    `TransformerBridge.train()` itself, which sets mode on
+    `original_model` in addition to the registered module tree
+    (`original_model` is deliberately not a registered submodule, so
+    `nn.Module.train()`'s own recursion never reaches it). This adapter
+    needs nothing extra for mode propagation.
 
     Setting mode on `model` directly still works too and stays in sync.
     """
@@ -484,16 +434,9 @@ def build_pretrain_bridge(
     if model_name is not None:
         kwargs["model_name"] = model_name
 
-    bridge = build_bridge_from_module(
+    return build_bridge_from_module(
         PretrainModelContainer(model),
         architecture=ARCHITECTURE_NAME,
         tl_config=cfg,
         **kwargs,
     )
-
-    # TODO:
-    # Generalize this into TransformerBridge itself once lifecycle
-    # propagation is addressed framework-wide.
-    bridge.__class__ = _get_mode_propagating_bridge_class(type(bridge))
-
-    return bridge

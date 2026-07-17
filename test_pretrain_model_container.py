@@ -1,6 +1,8 @@
 """Container, builder, and wrapped-model lifecycle behavior for
 PretrainModelContainer and build_pretrain_bridge -- kwarg filtering,
-output-contract normalization, train/eval mode propagation, and
+output-contract normalization, one end-to-end train/eval propagation
+smoke test (authoritative train/eval regression coverage lives in
+tests/unit/model_bridge/test_bridge_train_mode_propagation.py), and
 dtype/tied-weight preservation. Hook registration tests for the hidden
 MLP delegate
 (implemented by DenseOrMoEFeedForwardBridge) live here too, since what
@@ -143,57 +145,25 @@ class TestPretrainModelContainerHookRegistration:
 
 
 class TestTrainEvalModePropagation:
-    """bridge.train()/.eval() propagate to the wrapped model:
-    build_pretrain_bridge reassigns the returned bridge's class to a small
-    generated TransformerBridge subclass (see
-    _get_mode_propagating_bridge_class) whose overridden train() also sets
-    mode on original_model; inherited eval() calls train(False), so it
-    reaches the override too without needing its own override. This
-    closes a gap in TransformerBridge's own train()/eval(), which only
-    walk component_mapping and never reach original_model on their own."""
+    """End-to-end smoke of TransformerBridge.train()/eval() mode
+    propagation through build_pretrain_bridge. The authoritative,
+    architecture-independent regression coverage for the underlying
+    TransformerBridge.train() fix lives in
+    tests/unit/model_bridge/test_bridge_train_mode_propagation.py
+    (TestTrainEvalModePropagation there, against a minimal stub bridge);
+    this single test only confirms the behavior survives this adapter's
+    container wrapping and delegate exclusion."""
 
-    def test_bridge_eval_propagates_to_wrapped_model(self) -> None:
+    def test_mode_propagates_end_to_end_through_build_pretrain_bridge(self) -> None:
         cfg = _make_cfg(n_layers=1)
         model = TinyPretrainModel(d_model=16, n_heads=2, n_layers=1, d_ff=32, vocab_size=64)
         bridge = build_pretrain_bridge(model, cfg)
 
         assert model.training is True
-        bridge.eval()
-        assert model.training is False
-
-    def test_bridge_train_propagates_to_wrapped_model(self) -> None:
-        cfg = _make_cfg(n_layers=1)
-        model = TinyPretrainModel(d_model=16, n_heads=2, n_layers=1, d_ff=32, vocab_size=64)
-        bridge = build_pretrain_bridge(model, cfg)
-
-        model.eval()
-        assert model.training is False
-        bridge.train()
-        assert model.training is True
-
-    def test_caller_can_still_set_mode_directly_on_their_own_model_reference(self) -> None:
-        """Setting mode via the raw model reference still works and stays
-        in sync -- both paths write to the same underlying module."""
-        cfg = _make_cfg(n_layers=1)
-        model = TinyPretrainModel(d_model=16, n_heads=2, n_layers=1, d_ff=32, vocab_size=64)
-        build_pretrain_bridge(model, cfg)
-
-        model.eval()
-        assert model.training is False
-        model.train()
-        assert model.training is True
-
-    def test_train_and_eval_return_the_bridge_itself(self) -> None:
-        """nn.Module convention: train()/eval() return self, so callers can
-        chain (`model.train().to(device)`, etc). The generated subclass
-        must preserve this, not just the mode-propagation side effect."""
-        cfg = _make_cfg(n_layers=1)
-        model = TinyPretrainModel(d_model=16, n_heads=2, n_layers=1, d_ff=32, vocab_size=64)
-        bridge = build_pretrain_bridge(model, cfg)
-
-        assert bridge.train(False) is bridge
-        assert bridge.train(True) is bridge
         assert bridge.eval() is bridge
+        assert model.training is False
+        assert bridge.train() is bridge
+        assert model.training is True
 
     def test_bridge_can_be_reconstructed_from_supported_state(self) -> None:
         """The adapter's actual persistence contract is: rebuild the
